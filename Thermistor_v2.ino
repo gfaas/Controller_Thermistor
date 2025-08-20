@@ -4,10 +4,18 @@
 #include "hardware/pwm.h"
 
 
-#define HEAT 5                          
-#define MEASURE 4
-#define THERMISTOR A2                         // A_measure
-#define REFERENCE A1                          // A_current
+#include <Adafruit_NeoPixel.h>
+#include <Wire.h>
+#include "pico/stdlib.h"
+#include "hardware/pwm.h"
+#include "other/TRC_constants.h"
+
+/* #define TRC_VERSION "2025.06.19"
+
+#define HEAT 5                    //GPIO pin for heating      
+#define MEASURE 4           //GPIO pin for measurement  
+#define THERMISTOR A2                         // ADC_measure
+#define REFERENCE A1                          // ADC_current
 
 #define TRC_SIMULATED_ADDR 0x18 //I2C address simulated by thermistor regulator
 //registers for calculations/sampling
@@ -30,22 +38,20 @@
 #define TRC_HARDWARE_Rf 0x0E    //RW feedback resistor in ohms
 #define TRC_HARDWARE_Rc 0x0F    //RW restsance corrected for cable in ohms total
 
-#define TRC_REDBLINK 0x20
-#define TRC_GREENBLINK 0x21
-#define TRC_BLUEBLINK 0x22
+#define TRC_REG_H_DUITY 0x20 //register to R current heating duty cycle (0-9999) for PWM
 
-#define TRC_REPEATS 55
-#define TRC_RAISE_TIME 99
-#define TRC_H_DURATION 3000
-#define TRC_T_LIMIT 66
-#define TRC_PID_P 2500
-#define TRC_PID_I 15
-#define TRC_PID_D 1500
+#define TRC_REPEATS 500
+#define TRC_RAISE_TIME 2000
+#define TRC_H_DURATION 500
+#define TRC_T_LIMIT 120
+#define TRC_PID_P 200
+#define TRC_PID_I 30
+#define TRC_PID_D 200
 #define TRC_R_THERMISTOR 100
 #define TRC_R_FEEDBACK 20000
 #define TRC_R_CABLE 2
+*/
 
-#define TRC_VERSION "2025.04.23"
 
 // #DO NOT USE 0xFF, reserved for RECORDING on/off on RBP (to avoid any confusion)
 
@@ -59,7 +65,7 @@ Adafruit_NeoPixel pixels(NUMPIXELS, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 uint8_t PWM_slice_num; // PWM slice number for PWM current injection
 
 //constants for hardware
-u_int32_t firmware_version= 20250423;
+u_int32_t firmware_version= 20250619;
 float R_ratio_refrence, alpha, R_ratio, temperature;
 float R1= TRC_R_FEEDBACK;
 float R2= TRC_R_THERMISTOR;
@@ -93,7 +99,7 @@ float previous_error = 0;
 float integral = 0;
 float derivative = 0;
 uint32_t  pid_output = 0;
-int32_t heat_duration = 3000; //duration of heating in us. should be well over 80uS. Total cycle time is heat_duration + 200 us
+int32_t heat_duration = 3000; //duration of heating in us. should be well over 80uS. Total cycle time is heat_duration + ~200 us
 
 uint8_t incoming[4];
 
@@ -106,6 +112,7 @@ void setup()
   digitalWrite(HEAT, LOW);                 
   pinMode(MEASURE, OUTPUT);
   digitalWrite(MEASURE,LOW);   
+  
   gpio_set_function(HEAT, GPIO_FUNC_PWM); //set HEAT to PWM
   PWM_slice_num = pwm_gpio_to_slice_num(HEAT); //find out which PWM slice is connected to GPIO 0 (it's slice 0)
   pwm_set_wrap(PWM_slice_num, 10000); //set period of 1000 cycles (0 to 999 inclusive)  at 125 MHz this is a 80 uS
@@ -134,8 +141,8 @@ void loop()
     current_temp=MeasureRT(sample_repeat);
   }
   
-  //sprintf(textout, "temp: %.2fC  rep: %d  clamp: %2.2fC  t1: %4d  t2: %4d  H_dur: %4d  T_max: %3.0f  P: %4.0f I: %4.0f D: %4.0f ver: %d Rt: %.0f Rf: %.0f Rc: %.2f", current_temp, sample_repeat,T_set, t1, t2, heat_duration, T_limit, Kp, Ki, Kd, firmware_version, R2, R1, R_wire);
-  sprintf(textout, "UINT32: rep: %d t1: %4d H_dur: %4d      FLOATS: T_max: %3.0f  P: %4.0f I: %4.0f D: %4.0f Rt: %.0f Rf: %.0f Rc: %.2f", sample_repeat, t1, heat_duration, T_limit, Kp, Ki, Kd, R2, R1, R_wire);
+  sprintf(textout, "temp: %.2fC  d_cycle: %5d  rep: %d  clamp: %2.2fC  t1: %4d  t2: %4d  H_dur: %4d  T_max: %3.0f  P: %4.0f I: %4.0f D: %4.0f ver: %d Rt: %.0f Rf: %.0f Rc: %.2f", current_temp, pid_output, sample_repeat,T_set, t1, t2, heat_duration, T_limit, Kp, Ki, Kd, firmware_version, R2, R1, R_wire);
+  //sprintf(textout, "UINT32: rep: %d t1: %4d H_dur: %4d      FLOATS: T_max: %3.0f  P: %4.0f I: %4.0f D: %4.0f Rt: %.0f Rf: %.0f Rc: %.2f", sample_repeat, t1, heat_duration, T_limit, Kp, Ki, Kd, R2, R1, R_wire);
   Serial.println(textout);
 
   if (flag_h) //if heat clamping is active
@@ -156,6 +163,12 @@ void loop()
       HeatRT(heat_duration, pid_output); // Heat for 3000 us with duty cycle pid_output
     }
   }
+  if (!flag_h) //if not heating
+  {
+    pid_output=0; //if not heating, set output to 0
+  }
+  
+
 
   if ((millis()-timer_c1)>t1 && flag_c1 && !flag_c2) //if T1 has lapsed without reaching clamp temperature 
   {  
@@ -185,7 +198,7 @@ void AllStop()
   integral = 0;
   derivative = 0;
   pid_output=0;
-  HeatRT(1000, 0); //flush PWM
+  HeatRT(100, 0); //flush PWM
 }
 
 float MeasureRT(int repeats) 
@@ -213,7 +226,7 @@ void HeatRT(uint16_t heat_time, uint16_t heat_duty_cycle) //heat_time in us, hea
     pwm_set_enabled(PWM_slice_num, true);
     delayMicroseconds(heat_time);
     pwm_set_chan_level(PWM_slice_num, PWM_CHAN_B, 0);   //some time to make sure the cycle always ends low
-    delayMicroseconds(200);
+    delayMicroseconds(200); //wait for 200 us to let the PWM settle (with 125 MHz and 10000 cycles this is at least 80 us, take longer for if clock speed is lower))
     pwm_set_enabled(PWM_slice_num, false);
 }
 
@@ -292,6 +305,11 @@ void requestEvent() //SENDING DATA TO RBP
       for (int i=0;i<4;i++)
       {
         Wire.write(*((uint8_t*)&firmware_version+i));
+      }
+    case TRC_REG_H_DUITY:
+      for (int i=0;i<4;i++)
+      {
+        Wire.write(*((uint8_t*)&pid_output+i));
       }
       break;
     default:
